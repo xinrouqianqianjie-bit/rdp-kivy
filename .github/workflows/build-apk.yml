@@ -1,0 +1,219 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    env:
+      # 固定 Python 和 hostpython 版本，保证 p4a 两个 recipe 一致
+      VERSION_python3: "3.11.9"
+      VERSION_hostpython3: "3.11.9"
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # 2. 安装并强制使用 Java 17
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 3. 验证 Java 环境
+      - name: 检查 Java 环境
+        run: |
+          echo "========== Java 环境 =========="
+          echo "JAVA_HOME=$JAVA_HOME"
+          which java
+          java -version
+          javac -version
+
+          JAVA_VERSION=$(java -version 2>&1 | head -n 1)
+
+          if ! echo "$JAVA_VERSION" | grep -qE '"17([.]|")'; then
+            echo "::error::Java 版本不是 17，停止构建"
+            exit 1
+          fi
+
+          echo "Java 17 环境检查通过"
+
+      # 4. 准备源码，支持 src.zip、其他 ZIP 或根目录源码
+      - name: 准备源码
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          mkdir -p _unpacked
+          ZIPFILE=""
+
+          if [ -f src.zip ]; then
+            ZIPFILE="src.zip"
+          else
+            ZIPFILE=$(find . -maxdepth 1 -type f \
+              -name '*.zip' ! -name 'src.zip' -print -quit)
+          fi
+
+          if [ -n "$ZIPFILE" ]; then
+            echo "发现源码压缩包: $ZIPFILE"
+
+            unzip -q "$ZIPFILE" -d _unpacked
+
+            if [ -f _unpacked/buildozer.spec ]; then
+              SOURCE_DIR="_unpacked"
+            else
+              SPEC=$(find _unpacked -maxdepth 5 \
+                -type f -name buildozer.spec -print -quit)
+
+              if [ -z "$SPEC" ]; then
+                echo "::error::ZIP 文件中没有找到 buildozer.spec"
+                exit 1
+              fi
+
+              SOURCE_DIR=$(dirname "$SPEC")
+            fi
+
+            echo "源码目录: $SOURCE_DIR"
+            cp -a "$SOURCE_DIR"/. .
+
+          else
+            echo "没有发现 ZIP，使用仓库根目录源码"
+          fi
+
+          echo "========== 项目根目录 =========="
+          ls -la
+
+          if [ ! -f buildozer.spec ]; then
+            echo "::error::根目录没有 buildozer.spec，无法打包"
+            exit 1
+          fi
+
+          echo "源码准备完成"
+
+      # 5. 固定 Python 版本
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 6. 固定 buildozer.spec 中的 Python recipe 版本
+      - name: 配置 Python 依赖版本
+        shell: bash
+        run: |
+          set -eo pipefail
+
+          sed -i -E \
+            's/^([[:space:]]*requirements[[:space:]]*=[[:space:]]*)python3([^,]*)/\1python3==3.11.9/' \
+            buildozer.spec
+
+          echo "VERSION_python3=$VERSION_python3"
+          echo "VERSION_hostpython3=$VERSION_hostpython3"
+
+          echo "========== buildozer.spec 关键配置 =========="
+
+          grep -nE \
+            '^[[:space:]]*(requirements|package.name|source.dir|orientation|android.api|android.archs|android.ndk)[[:space:]]*=' \
+            buildozer.spec || true
+
+      # 7. 安装 Android 编译所需系统依赖
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            zip \
+            unzip \
+            autoconf \
+            automake \
+            libtool \
+            libtool-bin \
+            pkg-config \
+            zlib1g-dev \
+            libncurses-dev \
+            cmake \
+            libffi-dev \
+            libssl-dev
+
+          echo "========== 编译工具版本 =========="
+          autoconf --version | head -1
+          automake --version | head -1
+          libtool --version | head -1
+          cmake --version | head -1
+
+          echo "========== Python 环境 =========="
+          python --version
+          pip --version
+
+          echo "========== Java 环境 =========="
+          java -version
+
+      # 8. 缓存 Buildozer
+      - name: 缓存 Buildozer
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-ubuntu22-py3119-${{ github.sha }}
+          restore-keys: |
+            buildozer-ubuntu22-py3119-
+
+      # 9. 安装 Buildozer 和 Cython
+      - name: 安装 Buildozer 和 Cython
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+          pip install buildozer "cython==0.29.36"
+
+          echo "========== Buildozer 版本 =========="
+          buildozer --version
+
+          echo "========== Cython 版本 =========="
+          cython --version
+
+      # 10. 执行 APK 编译
+      - name: 编译 Android APK
+        shell: bash
+        run: |
+          set -o pipefail
+
+          echo "========== 开始 APK 编译 =========="
+          echo "Java:"
+          java -version
+
+          echo "Python:"
+          python --version
+
+          echo "开始执行 Buildozer..."
+
+          buildozer -v android debug 2>&1 | tee build.log
+
+          echo "========== APK 编译完成 =========="
+
+          ls -lh bin/*.apk
+
+      # 11. 上传 APK
+      - name: 上传 APK 文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: bin/*.apk
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 12. 上传完整构建日志
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 7
